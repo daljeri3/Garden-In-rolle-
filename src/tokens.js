@@ -58,6 +58,48 @@ export function currentMonthStr(d = new Date()) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 
+export const WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+// Kuwait Labor Law Article 70: 30 days paid annual leave per year, accrued
+// at 2.5 days per month of service (the standard prorated reading of "leave
+// for the fraction of the year in proportion with actual service").
+export function annualLeaveAccrued(contractStart, asOf = new Date()) {
+  if (!contractStart) return 0;
+  const start = new Date(contractStart);
+  if (start > asOf) return 0;
+  const months = (asOf.getFullYear() - start.getFullYear()) * 12 + (asOf.getMonth() - start.getMonth()) + (asOf.getDate() >= start.getDate() ? 1 : 0);
+  return Math.max(0, Math.round(Math.min(months, 12) * 2.5 * 10) / 10);
+}
+
+// Kuwait Labor Law Article 69: sick leave pay tiers per calendar year,
+// requires a medical report. daysUsedBeforeThis = sick days already
+// approved this year before the days being evaluated now.
+export function sickPayTier(daysUsedBeforeThis, daysInThisRequest) {
+  const tiers = [
+    { limit: 15, rate: 1 },
+    { limit: 10, rate: 0.75 },
+    { limit: 10, rate: 0.5 },
+    { limit: 10, rate: 0.25 },
+    { limit: 30, rate: 0 },
+  ];
+  let remaining = daysInThisRequest;
+  let used = daysUsedBeforeThis;
+  let payableDayEquivalent = 0; // in units of full-pay days
+  for (const tier of tiers) {
+    if (remaining <= 0) break;
+    const tierRemaining = Math.max(0, tier.limit - Math.max(0, used - (tier.limit - tier.limit)));
+    // how much of `used` falls before this tier ends
+    const tierFloor = tiers.slice(0, tiers.indexOf(tier)).reduce((s, t) => s + t.limit, 0);
+    const tierCeil = tierFloor + tier.limit;
+    const daysLeftInTier = Math.max(0, tierCeil - Math.max(used, tierFloor));
+    const take = Math.min(remaining, daysLeftInTier);
+    payableDayEquivalent += take * tier.rate;
+    remaining -= take;
+    used += take;
+  }
+  return payableDayEquivalent; // e.g. 3 days at 75% = 2.25
+}
+
 export function getLocation() {
   return new Promise((resolve, reject) => {
     if (!navigator.geolocation) { reject(new Error("Geolocation not supported on this device")); return; }

@@ -64,14 +64,14 @@ Total time: ~25 minutes, no coding required.
 ## Already deployed? Update without losing data
 
 You already have a live database with real employees and punches in it.
-Don't re-run `schema.sql` — that would try to recreate tables that already
-exist. Instead:
+Don't re-run `schema.sql`. Instead, run whichever migration files you
+haven't run yet, in order:
 
-1. Supabase → **SQL Editor → New query**
-2. Open `supabase/migration_v3.sql` from this project, copy ALL of it, paste, **Run**
-   - This only adds two new tables (payroll adjustments, warnings) — nothing existing is touched
-3. Re-upload all the project files to your GitHub repo (same `tahani-hr` folder, overwrite what's there)
-4. Vercel will redeploy automatically once it sees the new commit — or trigger it manually from the Deployments tab
+1. `supabase/migration_v3.sql` (if you haven't already) — adds payroll adjustments and warnings
+2. `supabase/migration_v4.sql` — adds medical certificate storage and the sick/absence fixes described below
+
+Supabase → **SQL Editor → New query** → paste the file → **Run**, for each one.
+Then re-upload the project files to your GitHub repo (overwrite what's there) and let Vercel redeploy.
 
 ## What's new in this version
 
@@ -82,28 +82,55 @@ exist. Instead:
 - **Excel export** — "Export Excel" button in the Overview downloads every punch record (name, date, time, location, GPS, Google Maps link) as a `.xlsx` file
 - **Kuwait Labor Law-based deductions and warnings** — see the section below
 - **Installable as an app** — see "Install on a phone" below
+- **Weekly off day** is now editable from Settings (defaults to Friday)
+- **Medical certificates for sick leave**, and **leave balances calculated per Kuwait Labor Law** — see below
 
 ## How deductions and warnings work (Kuwait Labor Law)
 
 Kuwait's Private Sector Labor Law (No. 6/2010) sets real rules for this, so the
-app follows them rather than an arbitrary formula:
+app follows them rather than an arbitrary formula. There are two genuinely
+different legal categories here, and the app now treats them differently:
 
-- **Article 38**: wage deductions can never exceed 5 days' pay in one month.
-  This is enforced in code — the app will not let a deduction exceed that,
-  no matter how many late arrivals or absences there are.
-- **Article 37**: a worker can't be penalized without being notified in
-  writing first. So the app treats the **first** late arrival or unexcused
-  absence in a calendar month as a **warning only** — no deduction — and
-  only deducts from the second occurrence onward. Every warning (automatic
-  or one you add manually) is kept in the Warnings list as a written record.
-- Kuwait law does **not** set a fixed table like "15 minutes late = X%
-  deduction" — that's specific to other GCC countries, not Kuwait. Employers
-  set their own penalty schedule, but it must be filed with the Public
-  Authority for Manpower (PAM) and posted publicly at the workplace.
-  **This app's Warnings list is a helpful internal record, not a substitute
-  for that filing** — if you want full legal coverage, get your actual
-  penalty bylaws reviewed and filed with PAM. I'm not a lawyer, and this is
-  a reasonable compliant structure, not certified legal advice.
+**Lateness — a disciplinary fine.** Article 38 caps disciplinary wage
+deductions at 5 days' pay per month, no matter how many times someone is
+late. The app enforces that cap in code. The first late arrival in a
+calendar month is a warning only (matching Article 37's requirement to
+notify a worker in writing before penalizing them) — deductions apply from
+the second late arrival onward, still capped.
+
+**Unexcused absence — simply unpaid time, not a fine.** If someone doesn't
+show up and has no approved leave or medical certificate covering that day,
+that's not a "penalty" under the law — it's just not earning wages for a
+day not worked. So absence deductions are **not** subject to the 5-day cap;
+every unexcused absence directly deducts that day's wage from the start. If
+an employee has more than 5 unexcused absences in a month, the payroll
+screen flags it — Article 41 allows dismissal without notice for excessive
+unauthorized absence, though the app only flags this for your review, it
+never acts on it automatically.
+
+**Sick leave — Article 69's pay scale, not a flat deduction.** Kuwait law
+entitles employees to up to 75 sick days per year, paid on a sliding scale:
+15 days full pay, next 10 at 75%, next 10 at 50%, next 10 at 25%, and the
+final 30 unpaid. The app tracks each employee's sick days used so far this
+calendar year and calculates pay for new sick leave against wherever they
+are on that scale. **A medical certificate is required** to submit a sick
+leave request — staff upload a photo or PDF of the doctor's note when they
+request it, stored privately (only they and managers can see it), and
+managers can view it before approving.
+
+**Annual leave** accrues at 2.5 days per month of service (Article 70's
+prorated entitlement), shown as a running balance on each employee's own
+punch screen and in the manager's payroll view.
+
+Kuwait law does **not** set a fixed table like "15 minutes late = X%
+deduction" for lateness — that's specific to other GCC countries, not
+Kuwait. Employers set their own lateness penalty schedule, but it must be
+filed with the Public Authority for Manpower (PAM) and posted publicly at
+the workplace. **This app's Warnings list is a helpful internal record, not
+a substitute for that filing** — if you want full legal coverage, get your
+actual penalty bylaws reviewed and filed with PAM. I'm not a lawyer, and
+this is a reasonable compliant structure based on the law's text, not
+certified legal advice.
 
 ## Install on a phone (no App Store needed)
 

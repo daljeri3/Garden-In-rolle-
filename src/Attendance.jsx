@@ -11,6 +11,7 @@ import { supabase } from "./supabaseClient";
 import {
   C, mono, pill, btnPrimary, btnGhost, inputStyle, label,
   todayStr, timeStr, haversine, getLocation, mapsLink, currentMonthStr,
+  WEEKDAY_NAMES, annualLeaveAccrued, sickPayTier,
 } from "./tokens";
 
 // Kuwait Labor Law No. 6/2010, Article 38: wage deductions for disciplinary
@@ -33,6 +34,9 @@ export default function Attendance({ me, isManager }) {
   const [showSettings, setShowSettings] = useState(false);
   const [showLeaveForm, setShowLeaveForm] = useState(false);
   const [leaveDraft, setLeaveDraft] = useState({ type: "Annual", from: todayStr(), to: todayStr(), reason: "" });
+  const [medicalFile, setMedicalFile] = useState(null);
+  const [leaveError, setLeaveError] = useState("");
+  const [uploadingLeave, setUploadingLeave] = useState(false);
   const [openPayrollId, setOpenPayrollId] = useState(null);
   const [adjustDraft, setAdjustDraft] = useState({ amount: "", note: "" });
   const [warnDraft, setWarnDraft] = useState({ employeeId: "", note: "" });
@@ -120,13 +124,36 @@ export default function Attendance({ me, isManager }) {
 
   async function submitLeave() {
     if (!leaveDraft.reason.trim()) return;
-    await supabase.from("leaves").insert({
-      employee_id: me.id, type: leaveDraft.type, from_date: leaveDraft.from, to_date: leaveDraft.to,
-      reason: leaveDraft.reason, status: "pending",
-    });
-    setLeaveDraft({ type: "Annual", from: todayStr(), to: todayStr(), reason: "" });
-    setShowLeaveForm(false);
-    loadMine(); if (isManager) loadManagerData();
+    if (leaveDraft.type === "Sick" && !medicalFile) {
+      setLeaveError("A medical certificate is required for sick leave (Kuwait Labor Law Article 69).");
+      return;
+    }
+    setLeaveError("");
+    setUploadingLeave(true);
+    let medicalPath = null;
+    try {
+      if (medicalFile) {
+        const path = `${me.id}/${Date.now()}_${medicalFile.name}`;
+        const { error: upErr } = await supabase.storage.from("medical-letters").upload(path, medicalFile);
+        if (upErr) throw upErr;
+        medicalPath = path;
+      }
+      await supabase.from("leaves").insert({
+        employee_id: me.id, type: leaveDraft.type, from_date: leaveDraft.from, to_date: leaveDraft.to,
+        reason: leaveDraft.reason, status: "pending", medical_letter_path: medicalPath,
+      });
+      setLeaveDraft({ type: "Annual", from: todayStr(), to: todayStr(), reason: "" });
+      setMedicalFile(null);
+      setShowLeaveForm(false);
+      loadMine(); if (isManager) loadManagerData();
+    } catch (err) {
+      setLeaveError("Couldn't submit: " + (err.message || "upload failed, try again."));
+    } finally { setUploadingLeave(false); }
+  }
+
+  async function viewMedicalLetter(path) {
+    const { data, error } = await supabase.storage.from("medical-letters").createSignedUrl(path, 60);
+    if (!error && data?.signedUrl) window.open(data.signedUrl, "_blank");
   }
 
   async function setLeaveStatus(id, status) {
@@ -200,18 +227,29 @@ export default function Attendance({ me, isManager }) {
     loadManagerData();
   }
 
-  // ---- Payroll: absence/lateness math with progressive warnings and the
-  // Article 38 monthly cap, enforced in code ----
+  // ---- Payroll: absence/lateness math with progressive warnings.
+  // Lateness is a disciplinary fine → capped at 5 days/month (Article 38).
+  // Unexcused absence is simply unpaid time, not a fine → NOT capped, since
+  // "no work, no pay" isn't a penalty under the law, it's just not earning
+  // wages for days not worked. Approved sick leave follows the Article 69
+  // pay tiers instead of a flat deduction. ----
   const salarySummary = useMemo(() => {
     if (!settings || !isManager) return [];
     const now = new Date();
     const year = now.getFullYear(), monthIdx = now.getMonth();
     const daysInMonth = new Date(year, monthIdx + 1, 0).getDate();
+    const yearStart = `${year}-01-01`;
 
     return employees.map((emp) => {
-      let absentCount = 0, lateCount = 0, lateMinutesTotal = 0;
-      let absentDeductibleDays = 0; // days beyond the first (warning-only) occurrence
+      let absentCount = 0, lateCount = 0, lateMinutesTotal = 0, sickDaysThisMonth = 0;
       const dailyRate = (emp.salary || 0) / 26;
+
+      // Sick days already used earlier this year (before this month), for tiering
+      const sickDaysUsedBeforeThisMonth = allLeaves.filter((l) =>
+        l.employee_id === emp.id && l.type === "Sick" && l.status === "approved" &&
+        l.from_date >= yearStart && l.from_date < `${year}-${String(monthIdx + 1).padStart(2, "0")}-01`
+      ).reduce((sum, l) => sum + (new Date(l.to_date) - new Date(l.from_date)) / 86400000 + 1, 0);
+      let sickRunning = sickDaysUsedBeforeThisMonth;
 
       for (let d = 1; d <= daysInMonth; d++) {
         const date = new Date(year, monthIdx, d);
@@ -219,13 +257,15 @@ export default function Attendance({ me, isManager }) {
         if (date.getDay() === settings.weekly_off) continue;
         const dstr = todayStr(date);
 
-        const approvedLeave = allLeaves.some((l) => l.employee_id === emp.id && l.status === "approved" && dstr >= l.from_date && dstr <= l.to_date);
-        if (approvedLeave) continue;
+        const approvedSick = allLeaves.some((l) => l.employee_id === emp.id && l.type === "Sick" && l.status === "approved" && dstr >= l.from_date && dstr <= l.to_date);
+        if (approvedSick) { sickDaysThisMonth++; continue; }
+
+        const approvedOtherLeave = allLeaves.some((l) => l.employee_id === emp.id && l.type !== "Sick" && l.status === "approved" && dstr >= l.from_date && dstr <= l.to_date);
+        if (approvedOtherLeave) continue;
 
         const dayIns = allPunches.filter((p) => p.employee_id === emp.id && p.ts.slice(0, 10) === dstr && p.type === "in");
         if (dayIns.length === 0) {
-          absentCount++;
-          if (absentCount > 1) absentDeductibleDays += 1; // 1st absence = warning only
+          absentCount++; // unexcused: no punch, no approved leave, no medical note
           continue;
         }
         const firstIn = new Date(dayIns.sort((a, b) => a.ts.localeCompare(b.ts))[0].ts);
@@ -234,25 +274,41 @@ export default function Attendance({ me, isManager }) {
         const lateMins = Math.max(0, (firstIn - shiftStart) / 60000 - settings.grace_minutes);
         if (lateMins > 0) {
           lateCount++;
-          if (lateCount > 1) lateMinutesTotal += lateMins; // 1st late = warning only
+          if (lateCount > 1) lateMinutesTotal += lateMins; // 1st late this month = warning only
         }
       }
 
-      const lateDeduction = (lateMinutesTotal / (8 * 60)) * dailyRate;
-      const absentDeduction = absentDeductibleDays * dailyRate;
-      const rawDeduction = absentDeduction + lateDeduction;
+      // Lateness: disciplinary fine, capped at 5 days' wage/month (Art. 38)
+      const rawLateDeduction = (lateMinutesTotal / (8 * 60)) * dailyRate;
       const legalCap = dailyRate * MAX_DEDUCTION_DAYS;
-      const capped = rawDeduction > legalCap;
-      const disciplinaryDeduction = Math.min(rawDeduction, legalCap);
+      const lateCapped = rawLateDeduction > legalCap;
+      const lateDeduction = Math.min(rawLateDeduction, legalCap);
+
+      // Absence: unpaid time, not a fine — direct, uncapped deduction
+      const absentDeduction = absentCount * dailyRate;
+      const highAbsenceRisk = absentCount > 5; // Art. 41 territory — flagged, not automated
+
+      // Sick leave: pay per Article 69 tier based on cumulative days this year
+      const sickPayable = sickPayTier(Math.round(sickRunning), sickDaysThisMonth);
+      const sickUnpaidDeduction = Math.max(0, (sickDaysThisMonth - sickPayable)) * dailyRate;
+
+      const disciplinaryDeduction = lateDeduction; // only the capped, fine-based part
+      const totalDeduction = disciplinaryDeduction + absentDeduction + sickUnpaidDeduction;
 
       const adj = adjustments.find((a) => a.employee_id === emp.id);
       const adjustment = adj?.amount || 0;
-      const netPay = Math.max(0, (emp.salary || 0) - disciplinaryDeduction + adjustment);
+      const netPay = Math.max(0, (emp.salary || 0) - totalDeduction + adjustment);
+
+      const usedAnnualThisYear = allLeaves.filter((l) =>
+        l.employee_id === emp.id && l.type === "Annual" && l.status === "approved" && l.from_date >= yearStart
+      ).reduce((sum, l) => sum + (new Date(l.to_date) - new Date(l.from_date)) / 86400000 + 1, 0);
+      const annualAccrued = annualLeaveAccrued(emp.contract_start, now);
+      const annualBalance = Math.max(0, annualAccrued - usedAnnualThisYear);
 
       return {
-        emp, absentCount, lateCount, disciplinaryDeduction, capped, adjustment,
-        note: adj?.note || "", netPay, firstAbsenceIsWarning: absentCount >= 1,
-        firstLateIsWarning: lateCount >= 1,
+        emp, absentCount, lateCount, lateDeduction, lateCapped, absentDeduction, highAbsenceRisk,
+        sickDaysThisMonth, sickUnpaidDeduction, totalDeduction, adjustment, note: adj?.note || "",
+        netPay, annualAccrued, annualBalance, sickUsedThisYear: Math.round(sickDaysUsedBeforeThisMonth + sickDaysThisMonth),
       };
     });
   }, [employees, allPunches, allLeaves, settings, isManager, adjustments]);
@@ -264,7 +320,7 @@ export default function Attendance({ me, isManager }) {
     if (!isManager || !settings || employees.length === 0) return;
     const toCreate = [];
     salarySummary.forEach(({ emp, absentCount, lateCount }) => {
-      if (absentCount >= 1) toCreate.push({ employee_id: emp.id, type: "absence", month, date: todayStr(), note: "Automatic: first unexcused absence this month" });
+      if (absentCount >= 1) toCreate.push({ employee_id: emp.id, type: "absence", month, date: todayStr(), note: "Automatic: unexcused absence on record this month" });
       if (lateCount >= 1) toCreate.push({ employee_id: emp.id, type: "late", month, date: todayStr(), note: "Automatic: first late arrival this month" });
     });
     if (toCreate.length === 0) return;
@@ -390,7 +446,7 @@ export default function Attendance({ me, isManager }) {
             {showLeaveForm && (
               <div style={{ marginBottom: 16, padding: 14, background: C.bg, borderRadius: 8 }}>
                 <div style={label}>Type</div>
-                <select value={leaveDraft.type} onChange={(e) => setLeaveDraft({ ...leaveDraft, type: e.target.value })} style={{ ...inputStyle, fontFamily: mono, marginBottom: 10 }}>
+                <select value={leaveDraft.type} onChange={(e) => { setLeaveDraft({ ...leaveDraft, type: e.target.value }); setLeaveError(""); }} style={{ ...inputStyle, fontFamily: mono, marginBottom: 10 }}>
                   {["Annual", "Sick", "Excuse", "Unpaid"].map((t) => <option key={t}>{t}</option>)}
                 </select>
                 <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
@@ -399,7 +455,17 @@ export default function Attendance({ me, isManager }) {
                 </div>
                 <div style={label}>Reason</div>
                 <textarea value={leaveDraft.reason} onChange={(e) => setLeaveDraft({ ...leaveDraft, reason: e.target.value })} style={{ ...inputStyle, minHeight: 60, marginBottom: 12 }} placeholder="Brief reason…" />
-                <button onClick={submitLeave} style={btnPrimary}>Submit request</button>
+                {leaveDraft.type === "Sick" && (
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={label}>Medical certificate — required for sick leave</div>
+                    <input type="file" accept="image/*,.pdf" onChange={(e) => { setMedicalFile(e.target.files[0] || null); setLeaveError(""); }} style={{ fontSize: 12.5 }} />
+                    <div style={{ fontSize: 11.5, color: C.inkSoft, marginTop: 6, lineHeight: 1.5 }}>
+                      Kuwait Labor Law (Article 69) requires a report from a doctor recognized by the employer, or a government health center, before sick leave is paid.
+                    </div>
+                  </div>
+                )}
+                {leaveError && <div style={{ fontSize: 12.5, color: C.red, marginBottom: 10 }}>{leaveError}</div>}
+                <button onClick={submitLeave} disabled={uploadingLeave} style={btnPrimary}>{uploadingLeave ? "Submitting…" : "Submit request"}</button>
               </div>
             )}
             {myLeaves.length === 0 && !showLeaveForm && <div style={{ fontSize: 13, color: C.inkSoft }}>No requests yet.</div>}
@@ -408,10 +474,16 @@ export default function Attendance({ me, isManager }) {
                 <div>
                   <div style={{ fontWeight: 600 }}>{l.type} · {l.from_date}{l.to_date !== l.from_date ? ` → ${l.to_date}` : ""}</div>
                   <div style={{ color: C.inkSoft, fontSize: 12 }}>{l.reason}</div>
+                  {l.medical_letter_path && <button onClick={() => viewMedicalLetter(l.medical_letter_path)} style={{ background: "none", border: "none", color: C.leaf, fontSize: 11.5, fontFamily: mono, padding: 0, cursor: "pointer" }}>View certificate ↗</button>}
                 </div>
                 <span style={pill(l.status === "approved" ? C.green : l.status === "rejected" ? C.redSoft : C.amberSoft, l.status === "approved" ? C.leafDark : l.status === "rejected" ? C.red : "#8C5B1E")}>{l.status}</span>
               </div>
             ))}
+          </div>
+
+          <div style={{ background: C.paper, border: `1px solid ${C.line}`, borderRadius: 12, padding: 20, marginTop: 18 }}>
+            <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12 }}>My leave balance</div>
+            <MyLeaveBalance me={me} allLeaves={myLeaves} />
           </div>
         </>
       ) : (
@@ -457,9 +529,15 @@ export default function Attendance({ me, isManager }) {
                 <div style={{ flex: 1 }}><div style={label}>Shop radius (m)</div><input type="number" value={settings.radius_meters} onChange={(e) => updateSetting({ radius_meters: Number(e.target.value) })} style={inputStyle} /></div>
                 <div style={{ flex: 1 }}><div style={label}>Grace (min)</div><input type="number" value={settings.grace_minutes} onChange={(e) => updateSetting({ grace_minutes: Number(e.target.value) })} style={inputStyle} /></div>
               </div>
-              <div style={{ display: "flex", gap: 10 }}>
+              <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
                 <div style={{ flex: 1 }}><div style={label}>Shift start</div><input type="time" value={settings.shift_start} onChange={(e) => updateSetting({ shift_start: e.target.value })} style={inputStyle} /></div>
                 <div style={{ flex: 1 }}><div style={label}>Shift end</div><input type="time" value={settings.shift_end} onChange={(e) => updateSetting({ shift_end: e.target.value })} style={inputStyle} /></div>
+              </div>
+              <div style={{ marginBottom: 4 }}>
+                <div style={label}>Weekly off day</div>
+                <select value={settings.weekly_off} onChange={(e) => updateSetting({ weekly_off: Number(e.target.value) })} style={{ ...inputStyle, fontFamily: mono }}>
+                  {WEEKDAY_NAMES.map((name, idx) => <option key={idx} value={idx}>{name}</option>)}
+                </select>
               </div>
               {gpsMsg && <div style={{ fontSize: 12, color: C.inkSoft, marginTop: 10 }}>{gpsMsg}</div>}
 
@@ -518,6 +596,11 @@ export default function Attendance({ me, isManager }) {
                       <div style={{ fontSize: 12, color: C.inkSoft, fontFamily: mono }}>{l.from_date}{l.to_date !== l.from_date ? ` → ${l.to_date}` : ""}</div>
                     </div>
                     <div style={{ fontSize: 12.5, color: C.inkSoft, marginBottom: 10 }}>{l.reason}</div>
+                    {l.medical_letter_path && (
+                      <button onClick={() => viewMedicalLetter(l.medical_letter_path)} style={{ background: "none", border: "none", color: C.leaf, fontSize: 12, fontFamily: mono, padding: 0, marginBottom: 10, display: "block", cursor: "pointer" }}>
+                        View medical certificate ↗
+                      </button>
+                    )}
                     <div style={{ display: "flex", gap: 8 }}>
                       <button onClick={() => setLeaveStatus(l.id, "approved")} style={{ ...btnGhost, color: C.leafDark, borderColor: "#CFE0CF", display: "flex", alignItems: "center", gap: 5 }}><Check size={12} /> Approve</button>
                       <button onClick={() => setLeaveStatus(l.id, "rejected")} style={{ ...btnGhost, color: C.red, borderColor: "#E6C8C4", display: "flex", alignItems: "center", gap: 5 }}><X size={12} /> Reject</button>
@@ -560,21 +643,31 @@ export default function Attendance({ me, isManager }) {
           )}
 
           <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 4 }}>This month's payroll</div>
-          <div style={{ fontSize: 11.5, color: C.inkSoft, fontFamily: mono, marginBottom: 10 }}>
-            First late/absence in the month = warning only, no deduction. Deductions capped at {MAX_DEDUCTION_DAYS} days' wage/month (Kuwait Labor Law Art. 38). Tap a row to add a bonus or manual adjustment.
+          <div style={{ fontSize: 11.5, color: C.inkSoft, fontFamily: mono, marginBottom: 10, lineHeight: 1.6 }}>
+            Lateness fines are capped at {MAX_DEDUCTION_DAYS} days' wage/month (Article 38). Absence is unpaid
+            time, not a fine, so it's deducted directly with no cap. Sick leave follows the Article 69 pay
+            scale. Tap a row to add a bonus or manual adjustment.
           </div>
           <div style={{ background: C.paper, border: `1px solid ${C.line}`, borderRadius: 12, overflow: "hidden" }}>
-            {salarySummary.map(({ emp, absentCount, lateCount, disciplinaryDeduction, capped, adjustment, note, netPay }) => (
+            {salarySummary.map(({ emp, absentCount, lateCount, lateDeduction, lateCapped, absentDeduction, highAbsenceRisk, sickDaysThisMonth, sickUnpaidDeduction, adjustment, note, netPay, annualBalance, sickUsedThisYear }) => (
               <div key={emp.id} style={{ padding: "13px 16px", borderBottom: `1px solid ${C.line}` }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
                   onClick={() => { setOpenPayrollId(openPayrollId === emp.id ? null : emp.id); setAdjustDraft({ amount: String(adjustment || ""), note: note || "" }); }}>
                   <div>
                     <div style={{ fontWeight: 600, fontSize: 14 }}>{emp.name}</div>
                     <div className="mono" style={{ fontFamily: mono, fontSize: 11.5, color: C.inkSoft }}>
-                      base {emp.salary} · {absentCount} absent · {lateCount} late · −{disciplinaryDeduction.toFixed(2)}
-                      {capped && <span style={{ color: C.amber }}> (capped)</span>}
+                      base {emp.salary} · {absentCount} absent (−{absentDeduction.toFixed(2)}) · {lateCount} late (−{lateDeduction.toFixed(2)}{lateCapped ? ", capped" : ""})
+                      {sickDaysThisMonth > 0 && ` · ${sickDaysThisMonth} sick (−${sickUnpaidDeduction.toFixed(2)})`}
                       {adjustment !== 0 && (adjustment > 0 ? ` · +${adjustment.toFixed(2)} adj` : ` · ${adjustment.toFixed(2)} adj`)}
                     </div>
+                    <div className="mono" style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, marginTop: 2 }}>
+                      Annual leave: {annualBalance.toFixed(1)}d left · Sick used this year: {sickUsedThisYear}/75d
+                    </div>
+                    {highAbsenceRisk && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: 4, color: C.red, fontSize: 11 }}>
+                        <AlertTriangle size={11} /> {absentCount} unexcused absences this month — review under Article 41
+                      </div>
+                    )}
                   </div>
                   <div className="mono" style={{ fontFamily: mono, fontSize: 14, fontWeight: 600 }}>KD {netPay.toFixed(2)}</div>
                 </div>
@@ -592,6 +685,30 @@ export default function Attendance({ me, isManager }) {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function MyLeaveBalance({ me, allLeaves }) {
+  const now = new Date();
+  const yearStart = `${now.getFullYear()}-01-01`;
+  const accrued = annualLeaveAccrued(me.contract_start, now);
+  const usedAnnual = allLeaves.filter((l) => l.type === "Annual" && l.status === "approved" && l.from_date >= yearStart)
+    .reduce((sum, l) => sum + (new Date(l.to_date) - new Date(l.from_date)) / 86400000 + 1, 0);
+  const usedSick = allLeaves.filter((l) => l.type === "Sick" && l.status === "approved" && l.from_date >= yearStart)
+    .reduce((sum, l) => sum + (new Date(l.to_date) - new Date(l.from_date)) / 86400000 + 1, 0);
+  const balance = Math.max(0, accrued - usedAnnual);
+
+  return (
+    <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+      <div>
+        <div className="mono" style={{ fontFamily: mono, fontSize: 22, fontWeight: 600 }}>{balance.toFixed(1)}</div>
+        <div style={{ fontSize: 11.5, color: C.inkSoft }}>annual leave days left</div>
+      </div>
+      <div>
+        <div className="mono" style={{ fontFamily: mono, fontSize: 22, fontWeight: 600 }}>{Math.round(usedSick)}<span style={{ fontSize: 13, color: C.inkSoft }}>/75</span></div>
+        <div style={{ fontSize: 11.5, color: C.inkSoft }}>sick days used this year</div>
+      </div>
     </div>
   );
 }
